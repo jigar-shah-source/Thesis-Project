@@ -1,0 +1,174 @@
+# ============================================
+# PLC Gateway Tool Configuration
+# TH Deggendorf Master Thesis
+# PLC IP: 192.168.0.0
+# Security: Basic256Sha256 / SignAndEncrypt
+# ============================================
+
+# OPC UA Server Configuration
+opcua:
+  server_url: "opc.tcp://192.168.1.57:4840"
+  namespace: 4
+  
+  # Security settings
+  security:
+    # Username/Password authentication
+    username: "Username"         #username changed for security reasons
+    password: "Password"         #password is also changed for privacy 
+    # Security policy and mode
+    policy: "Basic256Sha256"
+    mode: "SignAndEncrypt"
+    
+    # Certificate paths (will be auto-generated on first connection)
+    certificate: "certificates/client_cert.der"
+    private_key: "certificates/client_key.pem"
+  
+  # Variables to READ from PLC (PLC → SCADA)
+
+  read_variables:
+    - name: speed
+      node_id: "ns=4;s=MAIN.Dyno_Speed_RPM"
+    
+    - name: torque
+      node_id: "ns=4;s=MAIN.Dyno_Torque_Nm"
+    
+    - name: power
+      node_id: "ns=4;s=MAIN.Dyno_Power_kW"
+    
+    - name: motor_state
+      node_id: "ns=4;s=MAIN.Status_Motor_State"
+     
+    - name: system_ready
+      node_id: "ns=4;s=MAIN.Status_System_Ready"
+    
+    - name: alarm_active
+      node_id: "ns=4;s=MAIN.Status_Alarm_Active"
+      
+    - name: runtime_hours
+      node_id: "ns=4;s=MAIN.Status_Runtime_Hours"
+    
+    - name: temperature       
+      node_id: "ns=4;s=MAIN.Motor_Temperature_C"
+    
+    - name: voltage            
+      node_id: "ns=4;s=MAIN.Motor_Voltage_Measured_V"
+    
+    - name: efficiency         
+      node_id: "ns=4;s=MAIN.Efficiency_Percent"
+    
+    - name: electrical_power  
+      node_id: "ns=4;s=MAIN.Electrical_Power_kW"
+
+    - name: latency_avg
+      node_id: "ns=4;s=MAIN.Latency_Avg_us"
+
+    - name: latency_max
+      node_id: "ns=4;s=MAIN.Latency_Max_us"
+
+    - name: current
+      node_id: "ns=4;s=MAIN.Motor_Current_A"
+
+  
+  # Variables to WRITE to PLC (SCADA → PLC)
+  write_variables:
+    - name: "start_motor"
+      node_id: "ns=4;s=MAIN.CMD_Motor_Start"
+    
+    - name: "stop_motor"
+      node_id: "ns=4;s=MAIN.CMD_Motor_Stop"
+    
+    - name: "emergency_stop"
+      node_id: "ns=4;s=MAIN.CMD_Emergency_Stop"
+    
+    - name: "cmd_reset"
+      node_id: "ns=4;s=MAIN.CMD_Reset_Alarm"
+    
+    - name: "cmd_speed"
+      node_id: "ns=4;s=MAIN.CMD_Speed_Setpoint_RPM"
+
+# MQTT Broker Configuration (Ignition)
+mqtt:
+  broker: "localhost"
+  port: 1883
+  client_id: "plc_gateway_tool"
+  qos: 1
+  
+  # Topics to PUBLISH (PLC data → SCADA)
+  publish_topics:
+         speed: "TH_Deggendorf/Gateway_Thesis/Dyno_Motor_TestStand/dyno/speed"
+         torque: "TH_Deggendorf/Gateway_Thesis/Dyno_Motor_TestStand/dyno/torque"
+         power: "TH_Deggendorf/Gateway_Thesis/Dyno_Motor_TestStand/dyno/power"
+         voltage: "TH_Deggendorf/Gateway_Thesis/Dyno_Motor_TestStand/system/voltage"
+         motor_state: "TH_Deggendorf/Gateway_Thesis/Dyno_Motor_TestStand/motor/state"
+         system_ready: "TH_Deggendorf/Gateway_Thesis/Dyno_Motor_TestStand/system/ready"
+         alarm_active: "TH_Deggendorf/Gateway_Thesis/Dyno_Motor_TestStand/alarm/active"
+         runtime_hours: "TH_Deggendorf/Gateway_Thesis/Dyno_Motor_TestStand/system/runtime"
+         temperature: "TH_Deggendorf/Gateway_Thesis/Dyno_Motor_TestStand/system/temperature"
+         efficiency: "TH_Deggendorf/Gateway_Thesis/Dyno_Motor_TestStand/system/efficiency"
+         current: "TH_Deggendorf/Gateway_Thesis/Dyno_Motor_TestStand/system/current"  
+
+
+  # Topics to SUBSCRIBE (SCADA commands → PLC)
+  subscribe_topics:
+    - topic: "TH_Deggendorf/Gateway_Thesis/Dyno_Motor_TestStand/commands/start"
+      variable: "start_motor"
+      value_type: "bool"
+    
+    - topic: "TH_Deggendorf/Gateway_Thesis/Dyno_Motor_TestStand/commands/stop"
+      variable: "stop_motor"
+      value_type: "bool"
+    
+    - topic: "TH_Deggendorf/Gateway_Thesis/Dyno_Motor_TestStand/commands/emergency_stop"
+      variable: "emergency_stop"
+      value_type: "bool"
+  
+    
+    
+# Sparkplug B Configuration (Eclipse Tahu)
+sparkplug:
+  enabled: false  # Set to true to use Sparkplug B, false for plain MQTT
+  group_id: "TH_Deggendorf"
+  edge_node_id: "Gateway_Thesis"
+  device_id: "Dyno_Motor_TestStand"
+  broker: "localhost"
+  port: 1883
+
+# Data Logging Configuration
+logging:
+  enabled: true
+  interval: 1.0  # Sampling interval in seconds (1 Hz)
+  
+  csv:
+    enabled: true
+    path: "data/csv/"
+    filename_prefix: "dyno_log"
+  
+  json:
+    enabled: true
+    path: "data/json/"
+    filename_prefix: "dyno_log"
+  
+  sqlite:
+    enabled: true
+    path: "data/sqlite/dyno_data.db"
+    table_name: "measurements"
+
+# Application Logging
+app_logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  file: "gateway.log"
+  console: true
+
+
+# InfluxDB Cloud Configuration
+influxdb:
+  enabled: true
+  url: "https://eu-central-1-1.aws.cloud2.influxdata.com"
+  token: "API token you'll find and generate while loginning to InfluxDB for first time"
+  org: "TH_Deggendorf"
+  bucket: "Dyno_motor_Data"
+  measurement: "motor_data"
+  tags:
+    location: "TH_Deggendorf"
+    device: "Dyno_Motor_TestStand"
+    project: "Master_Thesis"
