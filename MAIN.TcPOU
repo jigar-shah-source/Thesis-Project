@@ -1,0 +1,736 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.16">
+  <POU Name="MAIN" Id="{8639d3d1-864a-4c08-aeaa-780611c6b72e}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM MAIN
+VAR
+    // ==========================================
+    // ETHERCAT I/O MAPPING
+    // ==========================================
+    AI_Torque_Raw AT %I*        : INT;   // EL3074 Ch2 - +-10V Torque signal
+    AI_Speed_Raw AT %I*         : INT;   // EL3074 Ch1 - +-10V Speed signal
+    AI_Temperature_Raw AT %I*   : INT;   // EL3208 Ch1 - PT1000 Temperature
+    AI_Voltage_Raw AT %I*       : INT;   // EL3074 Ch3 - LEM Current Transducer output
+
+    DI_Motor_Running AT %I*     : BOOL;
+    DI_Motor_Fault AT %I*       : BOOL;
+    DI_Emergency_Stop AT %I*    : BOOL;
+    DI_Start_Button AT %I*      : BOOL;
+    DI_Stop_Button AT %I*       : BOOL;
+
+    DO_Motor_Start AT %Q*       : BOOL;
+    DO_Motor_Enable AT %Q*      : BOOL;
+    DO_Alarm_Light AT %Q*       : BOOL;
+    DO_Run_Light AT %Q*         : BOOL;
+    DO_Ready_Light AT %Q*       : BOOL;
+
+    AO_Speed_Setpoint_Raw AT %Q* : INT;
+
+    // ==========================================
+    // SAFE COPIES OF HARDWARE INPUTS
+    // ==========================================
+    AI_Speed_Safe           : INT := 0;
+    AI_Torque_Safe          : INT := 0;
+    AI_Temperature_Safe     : INT := 0;
+    AI_Voltage_Safe         : INT := 0;
+
+    bFirstScan              : BOOL := TRUE;
+
+    // ==========================================
+    // CALIBRATION CONSTANTS - EL3074 +-10V LINEAR
+    // ==========================================
+    // EL3074: +-10V = raw -32768 to +32767
+    EL3074_RAW_MAX          : REAL := 32767.0;   // Raw value at +10V
+    EL3074_RAW_MIN          : REAL := -32768.0;  // Raw value at -10V
+
+    // Speed scaling - Calibrated: raw 2250 = 726 RPM
+    SPEED_DEADBAND_RPM      : REAL := 5.0;       // Below this = zero (noise filter)
+
+    // Torque scaling
+    TORQUE_DEADBAND_NM      : REAL := 0.02;      // Below this = zero (noise filter)
+
+    // ==========================================
+    // CURRENT SENSOR CALIBRATION
+    // LEM 200A/1:2000, 3 turns through CT, 100 Ohm burden resistor
+    // Measured calibration points:
+    //   0.02V (raw ~65)  = 0.0A  (no load)
+    //   0.20V (raw ~655) = 0.75A (at 0.66Nm torque)
+    // EL3074: 10V = raw 32767
+    // ==========================================
+    CURRENT_ZERO_RAW        : REAL := 65.0;      // Raw value at 0A (0.02V)
+    CURRENT_MAX_RAW         : REAL := 655.0;     // Raw value at max measured (0.20V)
+    CURRENT_MAX_A           : REAL := 0.75;      // Amps at max measured voltage
+    CURRENT_DEADBAND_A      : REAL := 0.05;      // Below this = zero
+
+    // Temperature: EL3208 PT1000
+    // Raw value = temperature in 0.1 degrees C units
+    // e.g. raw 250 = 25.0 degrees C
+    TEMP_MAX_C              : REAL := 150.0;     // Max clamp value
+
+    // ==========================================
+    // MEASURED VALUES (OPC UA)
+    // ==========================================
+    {attribute 'OPC.UA.DA' := '1'}
+    Dyno_Torque_Nm          : REAL := 0.0;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    Dyno_Speed_RPM          : REAL := 0.0;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    Dyno_Power_kW           : REAL := 0.0;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    Dyno_Power_W            : REAL := 0.0;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    Motor_Current_A         : REAL := 0.0;       // Measured motor current (LEM CT)
+
+    {attribute 'OPC.UA.DA' := '1'}
+    Motor_Temperature_C     : REAL := 0.0;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    Motor_Voltage_V         : REAL := 220.0;     // Nominal motor voltage (1-phase 220V)
+
+    {attribute 'OPC.UA.DA' := '1'}
+    Electrical_Power_kW     : REAL := 0.0;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    Efficiency_Percent      : REAL := 0.0;
+
+    // ==========================================
+    // LATENCY MEASUREMENT (OPC UA)
+    // ==========================================
+    {attribute 'OPC.UA.DA' := '1'}
+    Latency_Cycle_us        : UDINT := 0;        // Current cycle time in microseconds
+
+    {attribute 'OPC.UA.DA' := '1'}
+    Latency_Max_us          : UDINT := 0;        // Maximum latency recorded
+
+    {attribute 'OPC.UA.DA' := '1'}
+    Latency_Avg_us          : REAL := 0.0;       // Rolling average latency
+
+    // Internal latency variables
+    Latency_Timer           : TON;
+    Latency_Sum             : ULINT := 0;
+    Latency_Sample_Count    : UDINT := 0;
+    Latency_Cycle_Counter   : UDINT := 0;        // Separate counter for latency only
+
+    // ==========================================
+    // COMMANDS (OPC UA)
+    // ==========================================
+    {attribute 'OPC.UA.DA' := '1'}
+    {attribute 'OPC.UA.DA.Access' := '3'}
+    CMD_Motor_Start         : BOOL := FALSE;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    {attribute 'OPC.UA.DA.Access' := '3'}
+    CMD_Motor_Stop          : BOOL := FALSE;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    {attribute 'OPC.UA.DA.Access' := '3'}
+    CMD_Speed_Setpoint_RPM  : REAL := 0.0;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    {attribute 'OPC.UA.DA.Access' := '3'}
+    CMD_Torque_Limit_Nm     : REAL := 0.8;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    {attribute 'OPC.UA.DA.Access' := '3'}
+    CMD_Emergency_Stop      : BOOL := FALSE;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    {attribute 'OPC.UA.DA.Access' := '3'}
+    CMD_Reset_Alarm         : BOOL := FALSE;
+
+    // ==========================================
+    // STATUS (OPC UA)
+    // ==========================================
+    {attribute 'OPC.UA.DA' := '1'}
+    Status_Motor_State      : INT := 0;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    Status_System_Ready     : BOOL := FALSE;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    Status_Alarm_Active     : BOOL := FALSE;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    Status_Alarm_Message    : STRING(255) := '';
+
+    {attribute 'OPC.UA.DA' := '1'}
+    Status_Runtime_Hours    : REAL := 0.0;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    Status_Start_Count      : DINT := 0;
+
+    // ==========================================
+    // LIMITS (OPC UA)
+    // ==========================================
+    {attribute 'OPC.UA.DA' := '1'}
+    LIMIT_Max_Speed_RPM     : REAL := 2000.0;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    LIMIT_Max_Torque_Nm     : REAL := 10.0;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    LIMIT_Max_Current_A     : REAL := 1.5;       // Motor rated 1.3A + safety margin
+
+    {attribute 'OPC.UA.DA' := '1'}
+    LIMIT_Max_Temp_C        : REAL := 85.0;
+
+    {attribute 'OPC.UA.DA' := '1'}
+    LIMIT_Warning_Temp_C    : REAL := 70.0;
+
+    // ==========================================
+    // INTERNAL VARIABLES
+    // ==========================================
+    Internal_Run_Request    : BOOL := FALSE;
+    Internal_Alarm_Latch    : BOOL := FALSE;
+    Internal_Warning_Active : BOOL := FALSE;
+
+    Start_Button_Edge       : R_TRIG;
+    Stop_Button_Edge        : R_TRIG;
+
+    Startup_Timer           : TON;
+    Shutdown_Timer          : TON;
+    Runtime_Timer           : TON;
+
+    Runtime_Seconds         : DINT := 0;
+    Cycle_Counter           : UDINT := 0;
+
+    // ==========================================
+    // COMMAND EDGE DETECTION
+    // ==========================================
+    CMD_Start_Edge          : R_TRIG;
+    CMD_Stop_Edge           : R_TRIG;
+    CMD_EStop_Edge          : R_TRIG;
+    CMD_Reset_Edge          : R_TRIG;
+
+    // ==========================================
+    // SYSTEM INFO (OPC UA)
+    // ==========================================
+    {attribute 'OPC.UA.DA' := '1'}
+    System_Version          : STRING(50) := 'Motor_Dyno_v7.0_Final';
+
+    {attribute 'OPC.UA.DA' := '1'}
+    System_Author           : STRING(50) := 'TH Deggendorf Master Thesis';
+
+    Power_Factor            : REAL := 0.80;      // Motor nameplate cosφ
+
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// ═══════════════════════════════════════════════════════════════
+// FIRST SCAN INITIALIZATION
+// ═══════════════════════════════════════════════════════════════
+
+IF bFirstScan THEN
+    bFirstScan := FALSE;
+
+    // Initialize safe copies
+    AI_Speed_Safe           := 0;
+    AI_Torque_Safe          := 0;
+    AI_Temperature_Safe     := 0;
+    AI_Voltage_Safe         := 0;
+
+    // Initialize calculated values
+    Dyno_Speed_RPM          := 0.0;
+    Dyno_Torque_Nm          := 0.0;
+    Dyno_Power_kW           := 0.0;
+    Dyno_Power_W            := 0.0;
+    Motor_Current_A         := 0.0;
+    Motor_Temperature_C     := 0.0;
+    Electrical_Power_kW     := 0.0;
+    Efficiency_Percent      := 0.0;
+
+    // Initialize latency
+    Latency_Cycle_us        := 0;
+    Latency_Max_us          := 0;
+    Latency_Avg_us          := 0.0;
+    Latency_Sum             := 0;
+    Latency_Sample_Count    := 0;
+    Latency_Cycle_Counter   := 0;
+
+    // Initialize status
+    IF Status_Motor_State < 0 OR Status_Motor_State > 4 THEN
+        Status_Motor_State := 0;
+    END_IF;
+
+    Status_System_Ready     := TRUE;
+    Status_Alarm_Active     := FALSE;
+    Status_Alarm_Message    := '';
+
+END_IF;
+
+// ═══════════════════════════════════════════════════════════════
+// LATENCY MEASUREMENT
+// Counts PLC scan cycles per second to calculate cycle time
+// Cycle time (us) = 1,000,000 / cycles_per_second
+// ═══════════════════════════════════════════════════════════════
+
+// Increment latency counter every scan
+Latency_Cycle_Counter := Latency_Cycle_Counter + 1;
+
+// Measure every 1 second
+Latency_Timer(IN := TRUE, PT := T#1S);
+
+IF Latency_Timer.Q THEN
+
+    // Calculate cycle time in microseconds
+    IF Latency_Cycle_Counter > 0 THEN
+        Latency_Cycle_us := 1000000 / Latency_Cycle_Counter;
+    END_IF;
+
+    // Track maximum cycle time (worst case latency)
+    IF Latency_Cycle_us > Latency_Max_us THEN
+        Latency_Max_us := Latency_Cycle_us;
+    END_IF;
+
+    // Rolling average over last 100 measurements
+    Latency_Sample_Count := Latency_Sample_Count + 1;
+    Latency_Sum          := Latency_Sum + UDINT_TO_ULINT(Latency_Cycle_us);
+
+    IF Latency_Sample_Count >= 100 THEN
+        Latency_Avg_us       := ULINT_TO_REAL(Latency_Sum) / 100.0;
+        Latency_Sum          := 0;
+        Latency_Sample_Count := 0;
+    ELSIF Latency_Sample_Count > 0 THEN
+        Latency_Avg_us := ULINT_TO_REAL(Latency_Sum) /
+                          UDINT_TO_REAL(Latency_Sample_Count);
+    END_IF;
+
+    // Reset for next second
+    Latency_Cycle_Counter := 0;
+    Latency_Timer(IN := FALSE);
+
+END_IF;
+
+// General cycle counter (separate from latency counter)
+Cycle_Counter := Cycle_Counter + 1;
+
+// ═══════════════════════════════════════════════════════════════
+// VALIDATE AND COPY HARDWARE INPUTS (Every Scan)
+// EL3074: signed INT range -32768 to +32767 (+-10V bipolar)
+// EL3208: unsigned range 0 to 32767 (PT1000 in 0.1 degrees C)
+// Hold last good value on rail hit (no reset to zero)
+// ═══════════════════════════════════════════════════════════════
+
+// Speed - EL3074 Ch1
+IF AI_Speed_Raw > -32767 AND AI_Speed_Raw < 32767 THEN
+    AI_Speed_Safe := AI_Speed_Raw;
+END_IF;
+
+// Torque - EL3074 Ch2
+IF AI_Torque_Raw > -32767 AND AI_Torque_Raw < 32767 THEN
+    AI_Torque_Safe := AI_Torque_Raw;
+END_IF;
+
+// Temperature - EL3208 PT1000 - only positive values valid
+IF AI_Temperature_Raw >= 0 AND AI_Temperature_Raw <= 32767 THEN
+    AI_Temperature_Safe := AI_Temperature_Raw;
+ELSE
+    AI_Temperature_Safe := 0;
+END_IF;
+
+// Current (via LEM CT) - EL3074 Ch3 - only positive values valid
+IF AI_Voltage_Raw >= 0 AND AI_Voltage_Raw < 32767 THEN
+    AI_Voltage_Safe := AI_Voltage_Raw;
+END_IF;
+
+// ═══════════════════════════════════════════════════════════════
+// SPEED SCALING - EL3074 Ch1 +-10V LINEAR
+// Calibrated from real measurement:
+// raw 2250 = 726 RPM -> multiplier = 726/2250 = 0.3227
+// ═══════════════════════════════════════════════════════════════
+
+Dyno_Speed_RPM := ABS(INT_TO_REAL(AI_Speed_Safe) * 0.3227);
+
+IF Dyno_Speed_RPM < SPEED_DEADBAND_RPM THEN
+    Dyno_Speed_RPM := 0.0;
+END_IF;
+
+// ═══════════════════════════════════════════════════════════════
+// TORQUE SCALING - EL3074 Ch2 +-10V LINEAR
+// Calibrated: factor 0.526 applied after load test
+// Dyno outputs +-10V proportional to +-LIMIT_Max_Torque_Nm
+// ═══════════════════════════════════════════════════════════════
+
+Dyno_Torque_Nm := ABS((INT_TO_REAL(AI_Torque_Safe) / EL3074_RAW_MAX)
+                  * LIMIT_Max_Torque_Nm * 0.526);
+
+IF Dyno_Torque_Nm < TORQUE_DEADBAND_NM THEN
+    Dyno_Torque_Nm := 0.0;
+END_IF;
+
+// ═══════════════════════════════════════════════════════════════
+// CURRENT MEASUREMENT - LEM Hall-Effect Current Transducer
+// Specs: 200A rated, ratio 1:2000, 3 primary turns, 100 Ohm burden
+// Calibrated from real measurements:
+//   0.02V (raw ~65)  = 0.0A  (no load)
+//   0.20V (raw ~655) = 0.75A (at 0.66Nm torque)
+// Linear interpolation between calibration points
+// ═══════════════════════════════════════════════════════════════
+
+Motor_Current_A := ((INT_TO_REAL(AI_Voltage_Safe) - CURRENT_ZERO_RAW) /
+                    (CURRENT_MAX_RAW - CURRENT_ZERO_RAW)) * CURRENT_MAX_A;
+
+// Clamp to valid range
+IF Motor_Current_A < CURRENT_DEADBAND_A THEN
+    Motor_Current_A := 0.0;
+END_IF;
+
+IF Motor_Current_A > 2.0 THEN
+    Motor_Current_A := 2.0;  // Safety clamp - max possible for this motor
+END_IF;
+
+// ═══════════════════════════════════════════════════════════════
+// MECHANICAL POWER CALCULATION
+// Formula: P(W) = Torque(Nm) x Angular_velocity(rad/s)
+//          P(W) = Torque(Nm) x (Speed_RPM x 2 x PI / 60)
+// ═══════════════════════════════════════════════════════════════
+
+IF Dyno_Speed_RPM > 10.0 AND Dyno_Torque_Nm > 0.0 THEN
+    Dyno_Power_W  := Dyno_Torque_Nm * (Dyno_Speed_RPM * 2.0 * 3.14159 / 60.0);
+    Dyno_Power_kW := Dyno_Power_W / 1000.0;
+ELSE
+    Dyno_Power_kW := 0.0;
+    Dyno_Power_W  := 0.0;
+END_IF;
+
+// ═══════════════════════════════════════════════════════════════
+// TEMPERATURE SCALING - EL3208 PT1000
+// Raw value is directly in 0.1 degrees C units
+// Example: raw = 235 -> Motor_Temperature_C = 23.5 degrees C
+// ═══════════════════════════════════════════════════════════════
+
+IF AI_Temperature_Safe > 0 THEN
+    Motor_Temperature_C := INT_TO_REAL(AI_Temperature_Safe) / 10.0;
+END_IF;
+
+// Clamp to valid range
+IF Motor_Temperature_C < 0.0 THEN
+    Motor_Temperature_C := 0.0;
+ELSIF Motor_Temperature_C > TEMP_MAX_C THEN
+    Motor_Temperature_C := TEMP_MAX_C;
+END_IF;
+
+// ═══════════════════════════════════════════════════════════════
+// ELECTRICAL POWER CALCULATION
+// 1-phase motor: P(kW) = V x I x cosφ / 1000
+// Motor nameplate: 220V, cosφ = 0.80
+// ═══════════════════════════════════════════════════════════════
+
+IF Motor_Current_A > CURRENT_DEADBAND_A THEN
+    Electrical_Power_kW := (Motor_Voltage_V * Motor_Current_A * Power_Factor) / 1000.0;
+ELSE
+    Electrical_Power_kW := 0.0;
+END_IF;
+
+// ═══════════════════════════════════════════════════════════════
+// EFFICIENCY CALCULATION
+// eta(%) = (Mechanical Power / Electrical Power) x 100
+// Only calculate when both powers are meaningful
+// ═══════════════════════════════════════════════════════════════
+
+IF Electrical_Power_kW > 0.005 AND Dyno_Power_kW > 0.001 THEN
+    Efficiency_Percent := (Dyno_Power_kW / Electrical_Power_kW) * 100.0;
+
+    // Clamp to realistic range for this motor type
+    IF Efficiency_Percent > 95.0 THEN
+        Efficiency_Percent := 95.0;
+    ELSIF Efficiency_Percent < 0.0 THEN
+        Efficiency_Percent := 0.0;
+    END_IF;
+ELSE
+    Efficiency_Percent := 0.0;
+END_IF;
+
+// ═══════════════════════════════════════════════════════════════
+// SAFETY CHECKS
+// Priority: E-Stop > Torque > Speed > Current > Temperature
+// ═══════════════════════════════════════════════════════════════
+
+Status_Alarm_Active     := FALSE;
+Internal_Warning_Active := FALSE;
+Status_Alarm_Message    := '';
+
+// Emergency Stop - highest priority
+IF DI_Emergency_Stop OR CMD_Emergency_Stop THEN
+    Status_Alarm_Active  := TRUE;
+    Status_Alarm_Message := 'EMERGENCY STOP';
+    Internal_Run_Request := FALSE;
+    Internal_Alarm_Latch := TRUE;
+END_IF;
+
+// Torque limit
+IF ABS(Dyno_Torque_Nm) > LIMIT_Max_Torque_Nm THEN
+    Status_Alarm_Active  := TRUE;
+    Status_Alarm_Message := 'TORQUE LIMIT';
+    Internal_Run_Request := FALSE;
+    Internal_Alarm_Latch := TRUE;
+END_IF;
+
+// Speed limit
+IF ABS(Dyno_Speed_RPM) > LIMIT_Max_Speed_RPM THEN
+    Status_Alarm_Active  := TRUE;
+    Status_Alarm_Message := 'SPEED LIMIT';
+    Internal_Run_Request := FALSE;
+    Internal_Alarm_Latch := TRUE;
+END_IF;
+
+// Overcurrent
+IF Motor_Current_A > LIMIT_Max_Current_A THEN
+    Status_Alarm_Active  := TRUE;
+    Status_Alarm_Message := 'OVERCURRENT';
+    Internal_Run_Request := FALSE;
+    Internal_Alarm_Latch := TRUE;
+END_IF;
+
+// Overtemperature
+IF Motor_Temperature_C > LIMIT_Max_Temp_C THEN
+    Status_Alarm_Active  := TRUE;
+    Status_Alarm_Message := 'OVERHEATING';
+    Internal_Run_Request := FALSE;
+    Internal_Alarm_Latch := TRUE;
+END_IF;
+
+// Temperature warning (not alarm - just notification)
+IF Motor_Temperature_C > LIMIT_Warning_Temp_C AND
+   Motor_Temperature_C <= LIMIT_Max_Temp_C THEN
+    Internal_Warning_Active := TRUE;
+    IF Status_Alarm_Message = '' THEN
+        Status_Alarm_Message := 'TEMP WARNING';
+    END_IF;
+END_IF;
+
+// Motor hardware fault
+IF DI_Motor_Fault THEN
+    Status_Alarm_Active  := TRUE;
+    Status_Alarm_Message := 'MOTOR FAULT';
+    Internal_Run_Request := FALSE;
+    Internal_Alarm_Latch := TRUE;
+END_IF;
+
+// Command torque limit warning
+IF ABS(Dyno_Torque_Nm) > CMD_Torque_Limit_Nm THEN
+    Internal_Warning_Active := TRUE;
+    IF Status_Alarm_Message = '' THEN
+        Status_Alarm_Message := 'CMD TORQUE LIMIT';
+    END_IF;
+END_IF;
+
+// Maintain alarm if latched
+IF Internal_Alarm_Latch THEN
+    Status_Alarm_Active := TRUE;
+END_IF;
+
+// System ready: no alarms, no faults, no latch
+Status_System_Ready := NOT Status_Alarm_Active
+                       AND NOT DI_Emergency_Stop
+                       AND NOT DI_Motor_Fault
+                       AND NOT Internal_Alarm_Latch;
+
+// ═══════════════════════════════════════════════════════════════
+// COMMAND EDGE DETECTION
+// ═══════════════════════════════════════════════════════════════
+
+CMD_Start_Edge(CLK := CMD_Motor_Start);
+CMD_Stop_Edge(CLK  := CMD_Motor_Stop);
+CMD_EStop_Edge(CLK := CMD_Emergency_Stop);
+CMD_Reset_Edge(CLK := CMD_Reset_Alarm);
+Start_Button_Edge(CLK := DI_Start_Button);
+Stop_Button_Edge(CLK  := DI_Stop_Button);
+
+// ═══════════════════════════════════════════════════════════════
+// EMERGENCY STOP - Highest Priority, immediate response
+// ═══════════════════════════════════════════════════════════════
+
+IF CMD_EStop_Edge.Q OR DI_Emergency_Stop THEN
+    Status_Motor_State   := 0;
+    Status_Alarm_Active  := TRUE;
+    Status_Alarm_Message := 'EMERGENCY STOP';
+    Internal_Run_Request := FALSE;
+    Internal_Alarm_Latch := TRUE;
+    DO_Motor_Start       := FALSE;
+    DO_Motor_Enable      := FALSE;
+    DO_Alarm_Light       := TRUE;
+END_IF;
+
+// ═══════════════════════════════════════════════════════════════
+// ALARM RESET - Edge triggered, only if all faults cleared
+// ═══════════════════════════════════════════════════════════════
+
+IF CMD_Reset_Edge.Q THEN
+    IF NOT DI_Emergency_Stop
+       AND NOT DI_Motor_Fault
+       AND NOT CMD_Emergency_Stop
+       AND ABS(Dyno_Torque_Nm)  < LIMIT_Max_Torque_Nm
+       AND ABS(Dyno_Speed_RPM)  < LIMIT_Max_Speed_RPM
+       AND Motor_Current_A      < LIMIT_Max_Current_A
+       AND Motor_Temperature_C  < LIMIT_Max_Temp_C THEN
+
+        // All conditions safe - allow reset
+        Internal_Alarm_Latch := FALSE;
+        Status_Alarm_Active  := FALSE;
+        Status_Alarm_Message := '';
+        DO_Alarm_Light       := FALSE;
+    ELSE
+        Status_Alarm_Message := 'RESET BLOCKED - CLEAR FAULT FIRST';
+    END_IF;
+END_IF;
+
+// ═══════════════════════════════════════════════════════════════
+// COMMAND PROCESSING
+// ═══════════════════════════════════════════════════════════════
+
+// Start command - only from STOPPED state when system is ready
+IF (CMD_Start_Edge.Q OR Start_Button_Edge.Q)
+   AND Status_System_Ready
+   AND Status_Motor_State = 0 THEN
+    Status_Motor_State := 1;
+    Status_Start_Count := Status_Start_Count + 1;
+END_IF;
+
+// Stop command - from STARTING or RUNNING state
+IF (CMD_Stop_Edge.Q OR Stop_Button_Edge.Q)
+   AND (Status_Motor_State = 1 OR Status_Motor_State = 2) THEN
+    Status_Motor_State := 3;
+    Shutdown_Timer(IN  := FALSE);
+END_IF;
+
+// ═══════════════════════════════════════════════════════════════
+// STATE MACHINE
+// State 0 = STOPPED
+// State 1 = STARTING  (2 second startup delay)
+// State 2 = RUNNING
+// State 3 = STOPPING  (1 second shutdown delay)
+// State 4 = FAULT
+// ═══════════════════════════════════════════════════════════════
+
+CASE Status_Motor_State OF
+
+    0: // STOPPED
+        DO_Motor_Start       := FALSE;
+        DO_Motor_Enable      := FALSE;
+        DO_Run_Light         := FALSE;
+        DO_Ready_Light       := Status_System_Ready;
+        Internal_Run_Request := FALSE;
+        Runtime_Timer(IN     := FALSE);
+        Startup_Timer(IN     := FALSE);
+
+    1: // STARTING - 2 second startup delay before enabling motor
+        DO_Ready_Light := FALSE;
+        DO_Run_Light   := TRUE;
+        Startup_Timer(IN := TRUE, PT := T#2S);
+
+        IF Startup_Timer.Q THEN
+            DO_Motor_Start       := TRUE;
+            DO_Motor_Enable      := TRUE;
+            Internal_Run_Request := TRUE;
+            Status_Motor_State   := 2;
+        END_IF;
+
+        // Abort startup if alarm occurs
+        IF Status_Alarm_Active THEN
+            Status_Motor_State := 0;
+            Startup_Timer(IN   := FALSE);
+        END_IF;
+
+    2: // RUNNING
+        DO_Motor_Start       := TRUE;
+        DO_Motor_Enable      := TRUE;
+        DO_Run_Light         := TRUE;
+        DO_Ready_Light       := FALSE;
+        Internal_Run_Request := TRUE;
+
+        // Runtime counter - increments every 1 second
+        Runtime_Timer(IN := TRUE, PT := T#1S);
+        IF Runtime_Timer.Q THEN
+            Runtime_Seconds  := Runtime_Seconds + 1;
+            Runtime_Timer(IN := FALSE);
+        END_IF;
+
+        // Transition to stopping if alarm occurs
+        IF Status_Alarm_Active THEN
+            Status_Motor_State := 3;
+            Shutdown_Timer(IN  := FALSE);
+        END_IF;
+
+    3: // STOPPING - 1 second controlled shutdown
+        DO_Motor_Enable := FALSE;
+        DO_Run_Light    := FALSE;
+        DO_Ready_Light  := FALSE;
+        Shutdown_Timer(IN := TRUE, PT := T#1S);
+
+        IF Shutdown_Timer.Q THEN
+            DO_Motor_Start       := FALSE;
+            Internal_Run_Request := FALSE;
+            Status_Motor_State   := 0;
+            Runtime_Timer(IN     := FALSE);
+        END_IF;
+
+    4: // FAULT
+        DO_Motor_Start       := FALSE;
+        DO_Motor_Enable      := FALSE;
+        DO_Run_Light         := FALSE;
+        DO_Ready_Light       := FALSE;
+        DO_Alarm_Light       := TRUE;
+        Internal_Run_Request := FALSE;
+        Runtime_Timer(IN     := FALSE);
+
+        // Auto-recover to STOPPED when alarm clears
+        IF NOT Internal_Alarm_Latch AND NOT Status_Alarm_Active THEN
+            Status_Motor_State := 0;
+            DO_Alarm_Light     := FALSE;
+        END_IF;
+
+ELSE
+    // Invalid state - reset to STOPPED
+    Status_Motor_State := 0;
+
+END_CASE;
+
+// ═══════════════════════════════════════════════════════════════
+// VFD SPEED SETPOINT OUTPUT
+// Maps CMD_Speed_Setpoint_RPM to AO_Speed_Setpoint_Raw
+// 0 RPM = raw 0, LIMIT_Max_Speed_RPM = raw 32767
+// ═══════════════════════════════════════════════════════════════
+
+// Clamp setpoint to valid range
+IF CMD_Speed_Setpoint_RPM > LIMIT_Max_Speed_RPM THEN
+    CMD_Speed_Setpoint_RPM := LIMIT_Max_Speed_RPM;
+ELSIF CMD_Speed_Setpoint_RPM < 0.0 THEN
+    CMD_Speed_Setpoint_RPM := 0.0;
+END_IF;
+
+// Only output when motor is running
+IF Status_Motor_State = 2 THEN
+    AO_Speed_Setpoint_Raw := REAL_TO_INT((CMD_Speed_Setpoint_RPM / LIMIT_Max_Speed_RPM) * EL3074_RAW_MAX);
+    IF AO_Speed_Setpoint_Raw < 0 THEN
+        AO_Speed_Setpoint_Raw := 0;
+    ELSIF AO_Speed_Setpoint_Raw > 32767 THEN
+        AO_Speed_Setpoint_Raw := 32767;
+    END_IF;
+ELSE
+    AO_Speed_Setpoint_Raw := 0;
+END_IF;
+
+// ═══════════════════════════════════════════════════════════════
+// PHYSICAL INDICATORS
+// ═══════════════════════════════════════════════════════════════
+
+DO_Alarm_Light := Status_Alarm_Active OR (Status_Motor_State = 4);
+DO_Run_Light   := (Status_Motor_State = 2) OR (Status_Motor_State = 1);
+DO_Ready_Light := Status_System_Ready AND (Status_Motor_State = 0);
+
+// ═══════════════════════════════════════════════════════════════
+// RUNTIME TRACKING
+// Converts accumulated seconds to hours for display
+// ═══════════════════════════════════════════════════════════════
+
+Status_Runtime_Hours := DINT_TO_REAL(Runtime_Seconds) / 3600.0;]]></ST>
+    </Implementation>
+    <LineIds Name="MAIN">
+      <LineId Id="7039" Count="507" />
+      <LineId Id="4715" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>
